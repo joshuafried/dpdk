@@ -669,7 +669,20 @@ static inline void
 vtx1(volatile union ixgbe_adv_tx_desc *txdp,
 		struct rte_mbuf *pkt, uint64_t flags)
 {
-	__m128i descriptor = _mm_set_epi64x((uint64_t)pkt->pkt_len << 46 |
+	/* Set Packet Length */
+	uint64_t top_flags =  (uint64_t)pkt->pkt_len << 46;
+
+	/* Set IXGBE_TXD_POPTS_IXSM */
+	top_flags |= (pkt->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) >> 14;
+	RTE_BUILD_BUG_ON(
+		RTE_MBUF_F_TX_IP_CKSUM >> 14 != (uint64_t)IXGBE_TXD_POPTS_IXSM << 40);
+
+	/* Set IXGBE_TXD_POPTS_TXSM */
+	top_flags |= (pkt->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) >> 11;
+	RTE_BUILD_BUG_ON(
+		RTE_MBUF_F_TX_TCP_CKSUM >> 11 != (uint64_t)IXGBE_TXD_POPTS_TXSM << 40);
+
+	__m128i descriptor = _mm_set_epi64x(top_flags |
 			flags | pkt->data_len,
 			pkt->buf_iova + pkt->data_off);
 	_mm_store_si128(RTE_CAST_PTR(__m128i *, &txdp->read), descriptor);
