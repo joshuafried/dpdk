@@ -30,6 +30,108 @@ mana_mempool_chunk_cb(struct rte_mempool *mp __rte_unused, void *opaque,
 	range->len = range->end - range->start;
 }
 
+
+int
+mana_new_mr(struct mana_priv *priv, void *base, uint64_t len)
+{
+	struct ibv_mr *ibv_mr;
+	struct mana_mr_cache mr;
+	int ret;
+
+	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
+		DP_LOG(ERR, "multiprocess not supported for adding/removing MRs");
+		return -1;
+	}
+
+	ibv_mr = ibv_reg_mr(priv->ib_pd, (void *)base, len, IBV_ACCESS_LOCAL_WRITE);
+	if (ibv_mr) {
+		DP_LOG(DEBUG, "MR lkey %u addr %p len %zu",
+		       ibv_mr->lkey, ibv_mr->addr, ibv_mr->length);
+
+		mr.lkey = ibv_mr->lkey;
+		mr.addr = (uintptr_t)ibv_mr->addr;
+		mr.len = ibv_mr->length;
+		mr.verb_obj = ibv_mr;
+
+		rte_spinlock_lock(&priv->mr_btree_lock);
+		ret = mana_mr_btree_insert(&priv->mr_btree, &mr);
+		rte_spinlock_unlock(&priv->mr_btree_lock);
+		if (ret) {
+			ibv_dereg_mr(ibv_mr);
+			DP_LOG(ERR, "Failed to add to global MR btree");
+			return ret;
+		}
+	} else {
+		DP_LOG(ERR, "MR failed at 0x%" PRIxPTR " len %lu",
+		       (uintptr_t)base, len);
+		return -errno;
+	}
+	return 0;
+}
+
+static int mana_mr_btree_del(struct mana_mr_btree *bt, uint16_t idx)
+{
+	struct mana_mr_cache *table;
+
+	table = bt->table;
+	memmove(&table[idx], &table[idx + 1], (bt->len - idx) * sizeof(struct mana_mr_cache));
+	bt->len--;
+
+	return 0;
+}
+
+int
+mana_del_mr(struct mana_priv *priv, void *base, uint64_t len)
+{
+	struct ibv_mr *ibv_mr = NULL;
+	uint16_t idx;
+	struct mana_mr_cache *mr;
+	int ret;
+
+	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
+		DP_LOG(ERR, "multiprocess not supported for adding/removing MRs");
+		return -1;
+	}
+
+	// Make sure that this dpdk instance is single-threaded.
+	if (rte_lcore_count() > 1) {
+		DRV_LOG(ERR, "Cannot delete MRs in multi-threaded dpdk instances");
+		return -EPERM;
+	}
+
+	for (uint16_t i = 0; i < priv->dev_data->nb_tx_queues; i++) {
+		struct mana_txq *txq = (struct mana_txq *)priv->dev_data->tx_queues[i];
+		ret = mana_mr_btree_lookup(&txq->mr_btree, &idx,
+					(uintptr_t)base, len, &mr);
+		if (!ret && mr)
+			mana_mr_btree_del(&txq->mr_btree, idx);
+	}
+
+	for (uint16_t i = 0; i < priv->dev_data->nb_rx_queues; i++) {
+		struct mana_rxq *rxq = (struct mana_rxq *)priv->dev_data->rx_queues[i];
+		ret = mana_mr_btree_lookup(&rxq->mr_btree, &idx,
+					(uintptr_t)base, len, &mr);
+		if (!ret && mr)
+			mana_mr_btree_del(&rxq->mr_btree, idx);
+	}
+
+	rte_spinlock_lock(&priv->mr_btree_lock);
+	ret = mana_mr_btree_lookup(&priv->mr_btree, &idx, (uintptr_t)base, len, &mr);
+	if (!ret && mr) {
+		ibv_mr = mr->verb_obj;
+		mana_mr_btree_del(&priv->mr_btree, idx);
+	}
+	rte_spinlock_unlock(&priv->mr_btree_lock);
+
+	if (ret)
+		return -1;
+
+	if (ibv_mr)
+		ibv_dereg_mr(ibv_mr);
+
+	return 0;
+}
+
 /*
  * Register all memory regions from pool.
  */

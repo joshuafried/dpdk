@@ -334,6 +334,7 @@ struct mana_process_priv {
 
 struct mana_priv {
 	struct rte_eth_dev_data *dev_data;
+	struct rte_device *rte_dev;
 	struct mana_process_priv *process_priv;
 	int num_queues;
 
@@ -363,6 +364,7 @@ struct mana_priv {
 	uint64_t max_mr_size;
 	struct mana_mr_btree mr_btree;
 	rte_spinlock_t	mr_btree_lock;
+	TAILQ_ENTRY(mana_priv) next;
 };
 
 struct mana_txq_desc {
@@ -528,7 +530,8 @@ int mana_mr_btree_lookup(struct mana_mr_btree *bt, uint16_t *idx,
 int mana_mr_btree_insert(struct mana_mr_btree *bt, struct mana_mr_cache *entry);
 int mana_mr_btree_init(struct mana_mr_btree *bt, int n, int socket);
 void mana_mr_btree_free(struct mana_mr_btree *bt);
-
+int mana_del_mr(struct mana_priv *priv, void *base, uint64_t len);
+int mana_new_mr(struct mana_priv *priv, void *base, uint64_t len);
 /** Request timeout for IPC. */
 #define MANA_MP_REQ_TIMEOUT_SEC 5
 

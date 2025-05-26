@@ -124,6 +124,12 @@ rx_intr_vec_disable(struct mana_priv *priv)
 	rte_intr_nb_efd_set(intr_handle, 0);
 }
 
+/* Head of devices. */
+static TAILQ_HEAD(mana_devices, mana_priv) devices_list =
+				TAILQ_HEAD_INITIALIZER(devices_list);
+static pthread_mutex_t devices_list_lock;
+
+
 static int
 rx_intr_vec_enable(struct mana_priv *priv)
 {
@@ -188,12 +194,6 @@ mana_dev_start(struct rte_eth_dev *dev)
 	struct mana_priv *priv = dev->data->dev_private;
 
 	rte_spinlock_init(&priv->mr_btree_lock);
-	ret = mana_mr_btree_init(&priv->mr_btree, MANA_MR_BTREE_CACHE_N,
-				 dev->device->numa_node);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to init device MR btree %d", ret);
-		return ret;
-	}
 
 	ret = mana_start_tx_queues(dev);
 	if (ret) {
@@ -277,6 +277,10 @@ mana_dev_close(struct rte_eth_dev *dev)
 	int ret;
 
 	mana_remove_all_mr(priv);
+
+	pthread_mutex_lock(&devices_list_lock);
+	TAILQ_REMOVE(&devices_list, priv, next);
+	pthread_mutex_unlock(&devices_list_lock);
 
 	ret = mana_intr_uninstall(priv);
 	if (ret)
@@ -1223,6 +1227,8 @@ mana_init_once(void)
 
 	rte_spinlock_lock(&mana_shared_data_lock);
 
+	pthread_mutex_init(&devices_list_lock, NULL);
+
 	switch (rte_eal_process_type()) {
 	case RTE_PROC_PRIMARY:
 		if (mana_local_data.init_done)
@@ -1379,6 +1385,14 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 	priv->dev_port = port;
 	eth_dev->data->dev_private = priv;
 	priv->dev_data = eth_dev->data;
+	priv->rte_dev = &pci_dev->device;
+
+	ret = mana_mr_btree_init(&priv->mr_btree, MANA_MR_BTREE_CACHE_N,
+				 pci_dev->device.numa_node);
+	if (ret) {
+		DRV_LOG(ERR, "Failed to init device MR btree %d", ret);
+		return ret;
+	}
 
 	priv->max_rx_queues = dev_attr->orig_attr.max_qp;
 	priv->max_tx_queues = dev_attr->orig_attr.max_qp;
@@ -1418,6 +1432,10 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 	eth_dev->dev_ops = &mana_dev_ops;
 
 	rte_eth_dev_probing_finish(eth_dev);
+
+	pthread_mutex_lock(&devices_list_lock);
+	TAILQ_INSERT_HEAD(&devices_list, priv, next);
+	pthread_mutex_unlock(&devices_list_lock);
 
 	return 0;
 
@@ -1641,11 +1659,56 @@ static const struct rte_pci_id mana_pci_id_map[] = {
 	},
 };
 
+// pci_dev to mana_priv
+static struct mana_priv *
+mana_pci_dev_to_priv(struct rte_pci_device *pci_dev)
+{
+	struct mana_priv *priv;
+	pthread_mutex_lock(&devices_list_lock);
+	TAILQ_FOREACH(priv, &devices_list, next) {
+		DRV_LOG(INFO, "priv->rte_dev %p pci_dev->device %p", priv->rte_dev, &pci_dev->device);
+		if (priv->rte_dev == &pci_dev->device) {
+			pthread_mutex_unlock(&devices_list_lock);
+			return priv;
+		}
+	}
+	pthread_mutex_unlock(&devices_list_lock);
+	return NULL;
+}
+
+static int
+mana_pci_dma_map(struct rte_pci_device *pci_dev, void *addr,
+			uint64_t iova __rte_unused, size_t len)
+{
+	struct mana_priv *p = mana_pci_dev_to_priv(pci_dev);
+	if (!p) {
+		DRV_LOG(ERR, "Failed to find mana_priv for pci_dev");
+		return -ENODEV;
+	}
+
+	return mana_new_mr(p, addr, len);
+}
+
+static int
+mana_pci_dma_unmap(struct rte_pci_device *pci_dev, void *addr,
+			  uint64_t iova __rte_unused, size_t len)
+{
+	struct mana_priv *p = mana_pci_dev_to_priv(pci_dev);
+	if (!p) {
+		DRV_LOG(ERR, "Failed to find mana_priv for pci_dev");
+		return -ENODEV;
+	}
+
+	return mana_del_mr(p, addr, len);
+}
+
 static struct rte_pci_driver mana_pci_driver = {
 	.id_table = mana_pci_id_map,
 	.probe = mana_pci_probe,
 	.remove = mana_pci_remove,
 	.drv_flags = RTE_PCI_DRV_INTR_RMV,
+	.dma_map = mana_pci_dma_map,
+	.dma_unmap = mana_pci_dma_unmap,
 };
 
 RTE_PMD_REGISTER_PCI(net_mana, mana_pci_driver);
