@@ -391,9 +391,45 @@ rte_pmd_failsafe_remove(struct rte_vdev_device *vdev)
 	return fs_rte_eth_free(name);
 }
 
+static int rte_pmd_failsafe_dma_map(struct rte_vdev_device *dev, void *addr, uint64_t iova, size_t len) {
+	struct rte_eth_dev *eth_dev;
+	struct sub_device *sdev;
+	int ret;
+	uint8_t i;
+
+	const char *name = rte_vdev_device_name(dev);
+	eth_dev = rte_eth_dev_allocated(name);
+	FOREACH_SUBDEV(sdev, i, eth_dev) {
+		ret = rte_dev_dma_map(ETH(sdev)->device, addr, iova, len);
+		if (ret) ERROR("Failed to dma map");
+	}
+
+	return 0;
+
+}
+
+static int rte_pmd_failsafe_dma_unmap(struct rte_vdev_device *dev, void *addr, uint64_t iova, size_t len) {
+        struct rte_eth_dev *eth_dev;
+        struct sub_device *sdev;
+        int ret;
+        uint8_t i;
+
+        const char *name = rte_vdev_device_name(dev);
+        eth_dev = rte_eth_dev_allocated(name);
+        FOREACH_SUBDEV(sdev, i, eth_dev) {
+                ret = rte_dev_dma_unmap(ETH(sdev)->device, addr, iova, len);
+                if (ret) ERROR("Failed to dma map");
+        }
+
+        return 0;
+
+}
+
 static struct rte_vdev_driver failsafe_drv = {
 	.probe = rte_pmd_failsafe_probe,
 	.remove = rte_pmd_failsafe_remove,
+	.dma_map = rte_pmd_failsafe_dma_map,
+	.dma_unmap = rte_pmd_failsafe_dma_unmap,
 };
 
 RTE_PMD_REGISTER_VDEV(net_failsafe, failsafe_drv);
