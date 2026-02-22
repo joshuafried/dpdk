@@ -42,6 +42,9 @@
 #define IAVF_ENABLE_AUTO_RESET_ARG "auto_reset"
 #define IAVF_NO_POLL_ON_LINK_DOWN_ARG "no-poll-on-link-down"
 #define IAVF_MBUF_CHECK_ARG       "mbuf_check"
+#define IAVF_MDEV_ARG             "mdev"
+#define IAVF_MDEV_SYSFS_ARG       "mdev_sysfs"
+#define IAVF_MDEV_MAC_ARG         "mdev_mac"
 uint64_t iavf_timestamp_dynflag;
 int iavf_timestamp_dynfield_offset = -1;
 int rte_pmd_iavf_tx_lldp_dynfield_offset = -1;
@@ -53,8 +56,49 @@ static const char * const iavf_valid_args[] = {
 	IAVF_ENABLE_AUTO_RESET_ARG,
 	IAVF_NO_POLL_ON_LINK_DOWN_ARG,
 	IAVF_MBUF_CHECK_ARG,
+	IAVF_MDEV_ARG,
+	IAVF_MDEV_SYSFS_ARG,
+	IAVF_MDEV_MAC_ARG,
 	NULL
 };
+
+static int
+iavf_get_devarg_value(const struct rte_devargs *devargs,
+		const char *key, char *value, size_t value_len)
+{
+	const char *args, *arg_end;
+	size_t key_len;
+
+	if (devargs == NULL || devargs->args == NULL || key == NULL ||
+			value == NULL || value_len == 0)
+		return -1;
+
+	args = devargs->args;
+	key_len = strlen(key);
+	while (*args != '\0') {
+		size_t len;
+		const char *sep = strchr(args, ',');
+		const char *eq;
+
+		arg_end = sep != NULL ? sep : args + strlen(args);
+		eq = memchr(args, '=', arg_end - args);
+		if (eq != NULL && (size_t)(eq - args) == key_len &&
+				!strncmp(args, key, key_len)) {
+			len = arg_end - (eq + 1);
+			if (len >= value_len)
+				return -1;
+			memcpy(value, eq + 1, len);
+			value[len] = '\0';
+			return 0;
+		}
+
+		if (sep == NULL)
+			break;
+		args = sep + 1;
+	}
+
+	return -1;
+}
 
 static const struct rte_mbuf_dynfield iavf_proto_xtr_metadata_param = {
 	.name = "intel_pmd_dynfield_proto_xtr_metadata",
@@ -153,6 +197,7 @@ static int iavf_tm_ops_get(struct rte_eth_dev *dev __rte_unused, void *arg);
 
 static const struct rte_pci_id pci_id_iavf_map[] = {
 	{ RTE_PCI_DEVICE(IAVF_INTEL_VENDOR_ID, IAVF_DEV_ID_ADAPTIVE_VF) },
+	{ RTE_PCI_DEVICE(IAVF_INTEL_VENDOR_ID, IAVF_DEV_ID_ICE_MDEV_VF) },
 	{ RTE_PCI_DEVICE(IAVF_INTEL_VENDOR_ID, IAVF_DEV_ID_VF) },
 	{ RTE_PCI_DEVICE(IAVF_INTEL_VENDOR_ID, IAVF_DEV_ID_VF_HV) },
 	{ RTE_PCI_DEVICE(IAVF_INTEL_VENDOR_ID, IAVF_DEV_ID_X722_VF) },
@@ -271,6 +316,9 @@ static int
 iavf_vfr_inprogress(struct iavf_hw *hw)
 {
 	int inprogress = 0;
+
+	if (hw->device_id == IAVF_DEV_ID_ICE_MDEV_VF)
+		return 0;
 
 	if ((IAVF_READ_REG(hw, IAVF_VFGEN_RSTAT) &
 		IAVF_VFGEN_RSTAT_VFR_STATE_MASK) ==
@@ -768,8 +816,12 @@ iavf_init_rxq(struct rte_eth_dev *dev, struct iavf_rx_queue *rxq)
 	    rxq->max_pkt_len > buf_size) {
 		dev_data->scattered_rx = 1;
 	}
+	if (hw == NULL)
+		return -EINVAL;
+
 	IAVF_PCI_REG_WRITE(rxq->qrx_tail, rxq->nb_rx_desc - 1);
-	IAVF_WRITE_FLUSH(hw);
+	if (hw->device_id != IAVF_DEV_ID_ICE_MDEV_VF)
+		IAVF_WRITE_FLUSH(hw);
 
 	return 0;
 }
@@ -795,6 +847,48 @@ iavf_init_queues(struct rte_eth_dev *dev)
 	iavf_set_tx_function(dev);
 
 	return ret;
+}
+
+static int
+iavf_remap_queue_tails_mdev(struct rte_eth_dev *dev)
+{
+	struct iavf_adapter *ad =
+		IAVF_DEV_PRIVATE_TO_ADAPTER(dev->data->dev_private);
+	struct iavf_hw *hw = IAVF_DEV_PRIVATE_TO_HW(ad);
+	struct iavf_rx_queue **rxq =
+		(struct iavf_rx_queue **)dev->data->rx_queues;
+	struct ci_tx_queue **txq =
+		(struct ci_tx_queue **)dev->data->tx_queues;
+	uint16_t i;
+
+	if (hw->device_id != IAVF_DEV_ID_ICE_MDEV_VF)
+		return 0;
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++) {
+		volatile void *addr;
+
+		if (!rxq[i] || !rxq[i]->q_set)
+			continue;
+		addr = iavf_reg_addr(hw->hw_addr, hw->device_id,
+				     IAVF_QRX_TAIL1(rxq[i]->queue_id));
+		if (addr == NULL)
+			return -EINVAL;
+		rxq[i]->qrx_tail = (volatile uint8_t *)addr;
+	}
+
+	for (i = 0; i < dev->data->nb_tx_queues; i++) {
+		volatile void *addr;
+
+		if (!txq[i] || !txq[i]->q_set)
+			continue;
+		addr = iavf_reg_addr(hw->hw_addr, hw->device_id,
+				     IAVF_QTX_TAIL1(txq[i]->queue_id));
+		if (addr == NULL)
+			return -EINVAL;
+		txq[i]->qtx_tail = (volatile uint8_t *)addr;
+	}
+
+	return 0;
 }
 
 static int iavf_config_rx_queues_irqs(struct rte_eth_dev *dev,
@@ -1011,6 +1105,11 @@ iavf_dev_start(struct rte_eth_dev *dev)
 	vf->num_queue_pairs = RTE_MAX(dev->data->nb_rx_queues,
 				      dev->data->nb_tx_queues);
 	num_queue_pairs = vf->num_queue_pairs;
+
+	if (iavf_remap_queue_tails_mdev(dev) != 0) {
+		PMD_DRV_LOG(ERR, "Failed to map mdev queue tail registers");
+		return -1;
+	}
 
 	if (vf->vf_res->vf_cap_flags & VIRTCHNL_VF_OFFLOAD_QOS)
 		if (iavf_get_qos_cap(adapter)) {
@@ -2000,6 +2099,10 @@ iavf_check_vf_reset_done(struct iavf_hw *hw)
 {
 	int i, reset;
 
+	/* ICE mdev doesn't expose VFGEN_RSTAT, so skip this poll path. */
+	if (hw->device_id == IAVF_DEV_ID_ICE_MDEV_VF)
+		return 0;
+
 	for (i = 0; i < IAVF_RESET_WAIT_CNT; i++) {
 		reset = IAVF_READ_REG(hw, IAVF_VFGEN_RSTAT) &
 			IAVF_VFGEN_RSTAT_VFR_STATE_MASK;
@@ -2761,6 +2864,8 @@ iavf_dev_init(struct rte_eth_dev *eth_dev)
 	struct iavf_hw *hw = IAVF_DEV_PRIVATE_TO_HW(adapter);
 	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(adapter);
 	struct rte_pci_device *pci_dev = RTE_ETH_DEV_TO_PCI(eth_dev);
+	const struct rte_devargs *devargs = pci_dev->device.devargs;
+	char mdev_uuid[64];
 	int ret = 0;
 
 	PMD_INIT_FUNC_TRACE();
@@ -2793,6 +2898,11 @@ iavf_dev_init(struct rte_eth_dev *eth_dev)
 	hw->bus.device = pci_dev->addr.devid;
 	hw->bus.func = pci_dev->addr.function;
 	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;
+	if (iavf_get_devarg_value(devargs, IAVF_MDEV_ARG,
+			mdev_uuid, sizeof(mdev_uuid)) == 0) {
+		PMD_INIT_LOG(INFO,
+			"ICE mdev mode enabled for UUID %s", mdev_uuid);
+	}
 	hw->back = IAVF_DEV_PRIVATE_TO_ADAPTER(eth_dev->data->dev_private);
 	adapter->dev_data = eth_dev->data;
 	adapter->stopped = 1;

@@ -18,6 +18,7 @@
 #include <rte_malloc.h>
 #include <rte_vfio.h>
 #include <rte_eal.h>
+#include <rte_devargs.h>
 #include <bus_driver.h>
 #include <rte_spinlock.h>
 #include <rte_tailq.h>
@@ -42,6 +43,85 @@ static struct rte_tailq_elem rte_vfio_tailq = {
 	.name = "VFIO_RESOURCE_LIST",
 };
 EAL_REGISTER_TAILQ(rte_vfio_tailq)
+
+#define PCI_MDEV_SYSFS_DEVICES "/sys/bus/mdev/devices"
+#define PCI_DEVARG_MDEV "mdev"
+#define PCI_DEVARG_MDEV_SYSFS "mdev_sysfs"
+
+static int
+pci_vfio_get_devarg_value(const struct rte_pci_device *dev,
+		const char *key, char *value, size_t value_len)
+{
+	const struct rte_devargs *devargs = dev->device.devargs;
+	const char *args, *arg_end;
+	size_t key_len;
+
+	if (devargs == NULL || devargs->args == NULL || key == NULL ||
+			value == NULL || value_len == 0)
+		return -1;
+
+	args = devargs->args;
+	key_len = strlen(key);
+	while (*args != '\0') {
+		size_t len;
+		const char *sep = strchr(args, ',');
+		const char *eq;
+
+		arg_end = sep != NULL ? sep : args + strlen(args);
+		eq = memchr(args, '=', arg_end - args);
+		if (eq != NULL && (size_t)(eq - args) == key_len &&
+				!strncmp(args, key, key_len)) {
+			len = arg_end - (eq + 1);
+			if (len >= value_len)
+				return -1;
+			memcpy(value, eq + 1, len);
+			value[len] = '\0';
+			return 0;
+		}
+
+		if (sep == NULL)
+			break;
+		args = sep + 1;
+	}
+
+	return -1;
+}
+
+static bool
+pci_vfio_has_mdev_devarg(const struct rte_pci_device *dev)
+{
+	char mdev_uuid[PATH_MAX];
+
+	return pci_vfio_get_devarg_value(dev, PCI_DEVARG_MDEV,
+			mdev_uuid, sizeof(mdev_uuid)) == 0;
+}
+
+static void
+pci_vfio_get_device_selector(const struct rte_pci_device *dev,
+		char *pci_addr, size_t pci_addr_len,
+		const char **sysfs_base, const char **dev_addr,
+		char *mdev_sysfs, size_t mdev_sysfs_len,
+		char *mdev_uuid, size_t mdev_uuid_len)
+{
+	const struct rte_pci_addr *loc = &dev->addr;
+
+	snprintf(pci_addr, pci_addr_len, PCI_PRI_FMT,
+			loc->domain, loc->bus, loc->devid, loc->function);
+	*sysfs_base = rte_pci_get_sysfs_path();
+	*dev_addr = pci_addr;
+
+	if (pci_vfio_get_devarg_value(dev, PCI_DEVARG_MDEV,
+			mdev_uuid, mdev_uuid_len) != 0)
+		return;
+
+	if (pci_vfio_get_devarg_value(dev, PCI_DEVARG_MDEV_SYSFS,
+			mdev_sysfs, mdev_sysfs_len) != 0)
+		snprintf(mdev_sysfs, mdev_sysfs_len, "%s",
+				PCI_MDEV_SYSFS_DEVICES);
+
+	*sysfs_base = mdev_sysfs;
+	*dev_addr = mdev_uuid;
+}
 
 static int
 pci_vfio_get_region(const struct rte_pci_device *dev, int index,
@@ -105,13 +185,53 @@ pci_vfio_write_config(const struct rte_pci_device *dev,
 }
 
 /* get PCI BAR number where MSI-X interrupts are */
+static off_t
+pci_vfio_find_capability(const struct rte_pci_device *dev, uint8_t cap)
+{
+	uint16_t status;
+	uint8_t pos;
+	int ttl;
+
+	if (pci_vfio_read_config(dev, &status, sizeof(status),
+			RTE_PCI_STATUS) != sizeof(status))
+		return -1;
+
+	if ((status & RTE_PCI_STATUS_CAP_LIST) == 0)
+		return 0;
+
+	if (pci_vfio_read_config(dev, &pos, sizeof(pos),
+			RTE_PCI_CAPABILITY_LIST) != sizeof(pos))
+		return -1;
+
+	ttl = (RTE_PCI_CFG_SPACE_SIZE - RTE_PCI_STD_HEADER_SIZEOF) /
+		RTE_PCI_CAP_SIZEOF;
+	while (pos && ttl--) {
+		uint16_t ent;
+		uint8_t id;
+
+		if (pci_vfio_read_config(dev, &ent, sizeof(ent), pos) !=
+				sizeof(ent))
+			return -1;
+
+		id = ent & 0xff;
+		if (id == 0xff)
+			break;
+		if (id == cap)
+			return pos;
+
+		pos = ent >> 8;
+	}
+
+	return 0;
+}
+
 static int
 pci_vfio_get_msix_bar(const struct rte_pci_device *dev,
 	struct pci_msix_table *msix_table)
 {
 	off_t cap_offset;
 
-	cap_offset = rte_pci_find_capability(dev, RTE_PCI_CAP_ID_MSIX);
+	cap_offset = pci_vfio_find_capability(dev, RTE_PCI_CAP_ID_MSIX);
 	if (cap_offset < 0)
 		return -1;
 
@@ -119,17 +239,17 @@ pci_vfio_get_msix_bar(const struct rte_pci_device *dev,
 		uint16_t flags;
 		uint32_t reg;
 
-		if (rte_pci_read_config(dev, &reg, sizeof(reg), cap_offset +
-				RTE_PCI_MSIX_TABLE) < 0) {
-			PCI_LOG(ERR, "Cannot read MSIX table from PCI config space!");
-			return -1;
-		}
+			if (pci_vfio_read_config(dev, &reg, sizeof(reg), cap_offset +
+					RTE_PCI_MSIX_TABLE) < 0) {
+				PCI_LOG(ERR, "Cannot read MSIX table from PCI config space!");
+				return -1;
+			}
 
-		if (rte_pci_read_config(dev, &flags, sizeof(flags), cap_offset +
-				RTE_PCI_MSIX_FLAGS) < 0) {
-			PCI_LOG(ERR, "Cannot read MSIX flags from PCI config space!");
-			return -1;
-		}
+			if (pci_vfio_read_config(dev, &flags, sizeof(flags), cap_offset +
+					RTE_PCI_MSIX_FLAGS) < 0) {
+				PCI_LOG(ERR, "Cannot read MSIX flags from PCI config space!");
+				return -1;
+			}
 
 		msix_table->bar_index = reg & RTE_PCI_MSIX_TABLE_BIR;
 		msix_table->offset = reg & RTE_PCI_MSIX_TABLE_OFFSET;
@@ -744,8 +864,11 @@ pci_vfio_map_resource_primary(struct rte_pci_device *dev)
 	struct vfio_device_info device_info = { .argsz = sizeof(device_info) };
 	struct vfio_region_info *reg = NULL;
 	char pci_addr[PATH_MAX] = {0};
+	char mdev_sysfs[PATH_MAX] = {0};
+	char mdev_uuid[PATH_MAX] = {0};
+	const char *sysfs_base;
+	const char *dev_addr;
 	int vfio_dev_fd;
-	struct rte_pci_addr *loc = &dev->addr;
 	int i, j, ret;
 	struct mapped_pci_resource *vfio_res = NULL;
 	struct mapped_pci_res_list *vfio_res_list =
@@ -761,12 +884,12 @@ pci_vfio_map_resource_primary(struct rte_pci_device *dev)
 		return -1;
 #endif
 
-	/* store PCI address string */
-	snprintf(pci_addr, sizeof(pci_addr), PCI_PRI_FMT,
-			loc->domain, loc->bus, loc->devid, loc->function);
+	pci_vfio_get_device_selector(dev, pci_addr, sizeof(pci_addr),
+			&sysfs_base, &dev_addr, mdev_sysfs, sizeof(mdev_sysfs),
+			mdev_uuid, sizeof(mdev_uuid));
 
-	ret = rte_vfio_setup_device(rte_pci_get_sysfs_path(), pci_addr,
-					&vfio_dev_fd, &device_info);
+	ret = rte_vfio_setup_device(sysfs_base, dev_addr,
+						&vfio_dev_fd, &device_info);
 	if (ret)
 		return ret;
 
@@ -887,9 +1010,9 @@ pci_vfio_map_resource_primary(struct rte_pci_device *dev)
 			}
 		}
 
-		if (maps[i].nr_areas > 0) {
-			ret = pci_vfio_sparse_mmap_bar(vfio_dev_fd, vfio_res, i, 0);
-			if (ret < 0) {
+			if (maps[i].nr_areas > 0) {
+				ret = pci_vfio_sparse_mmap_bar(vfio_dev_fd, vfio_res, i, 0);
+				if (ret < 0) {
 				PCI_LOG(ERR, "%s sparse mapping BAR%i failed: %s",
 					pci_addr, i, strerror(errno));
 				free(reg);
@@ -902,13 +1025,13 @@ pci_vfio_map_resource_primary(struct rte_pci_device *dev)
 					pci_addr, i, strerror(errno));
 				free(reg);
 				goto err_map;
+				}
 			}
+
+			dev->mem_resource[i].addr = maps[i].addr;
+
+			free(reg);
 		}
-
-		dev->mem_resource[i].addr = maps[i].addr;
-
-		free(reg);
-	}
 
 	if (pci_rte_vfio_setup_device(dev, vfio_dev_fd) < 0) {
 		PCI_LOG(ERR, "%s setup device failed", pci_addr);
@@ -916,9 +1039,11 @@ pci_vfio_map_resource_primary(struct rte_pci_device *dev)
 	}
 
 #ifdef HAVE_VFIO_DEV_REQ_INTERFACE
-	if (pci_vfio_enable_notifier(dev, vfio_dev_fd) != 0) {
-		PCI_LOG(ERR, "Error setting up notifier!");
-		goto err_map;
+	if (!pci_vfio_has_mdev_devarg(dev)) {
+		if (pci_vfio_enable_notifier(dev, vfio_dev_fd) != 0) {
+			PCI_LOG(ERR, "Error setting up notifier!");
+			goto err_map;
+		}
 	}
 
 #endif
@@ -935,8 +1060,7 @@ err_map:
 err_vfio_res:
 	rte_free(vfio_res);
 err_vfio_dev_fd:
-	rte_vfio_release_device(rte_pci_get_sysfs_path(),
-			pci_addr, vfio_dev_fd);
+	rte_vfio_release_device(sysfs_base, dev_addr, vfio_dev_fd);
 	return -1;
 }
 
@@ -945,8 +1069,11 @@ pci_vfio_map_resource_secondary(struct rte_pci_device *dev)
 {
 	struct vfio_device_info device_info = { .argsz = sizeof(device_info) };
 	char pci_addr[PATH_MAX] = {0};
+	char mdev_sysfs[PATH_MAX] = {0};
+	char mdev_uuid[PATH_MAX] = {0};
+	const char *sysfs_base;
+	const char *dev_addr;
 	int vfio_dev_fd;
-	struct rte_pci_addr *loc = &dev->addr;
 	int i, j, ret;
 	struct mapped_pci_resource *vfio_res = NULL;
 	struct mapped_pci_res_list *vfio_res_list =
@@ -961,9 +1088,9 @@ pci_vfio_map_resource_secondary(struct rte_pci_device *dev)
 		return -1;
 #endif
 
-	/* store PCI address string */
-	snprintf(pci_addr, sizeof(pci_addr), PCI_PRI_FMT,
-			loc->domain, loc->bus, loc->devid, loc->function);
+	pci_vfio_get_device_selector(dev, pci_addr, sizeof(pci_addr),
+			&sysfs_base, &dev_addr, mdev_sysfs, sizeof(mdev_sysfs),
+			mdev_uuid, sizeof(mdev_uuid));
 
 	/* if we're in a secondary process, just find our tailq entry */
 	TAILQ_FOREACH(vfio_res, vfio_res_list, next) {
@@ -978,8 +1105,8 @@ pci_vfio_map_resource_secondary(struct rte_pci_device *dev)
 		return -1;
 	}
 
-	ret = rte_vfio_setup_device(rte_pci_get_sysfs_path(), pci_addr,
-					&vfio_dev_fd, &device_info);
+	ret = rte_vfio_setup_device(sysfs_base, dev_addr,
+						&vfio_dev_fd, &device_info);
 	if (ret)
 		return ret;
 
@@ -1024,8 +1151,7 @@ err_vfio_dev_fd:
 		if (maps[j].addr)
 			pci_unmap_resource(maps[j].addr, maps[j].size);
 	}
-	rte_vfio_release_device(rte_pci_get_sysfs_path(),
-			pci_addr, vfio_dev_fd);
+	rte_vfio_release_device(sysfs_base, dev_addr, vfio_dev_fd);
 	return -1;
 }
 
@@ -1087,20 +1213,25 @@ static int
 pci_vfio_unmap_resource_primary(struct rte_pci_device *dev)
 {
 	char pci_addr[PATH_MAX] = {0};
-	struct rte_pci_addr *loc = &dev->addr;
+	char mdev_sysfs[PATH_MAX] = {0};
+	char mdev_uuid[PATH_MAX] = {0};
+	const char *sysfs_base;
+	const char *dev_addr;
 	struct mapped_pci_resource *vfio_res = NULL;
 	struct mapped_pci_res_list *vfio_res_list;
 	int ret, vfio_dev_fd;
 
-	/* store PCI address string */
-	snprintf(pci_addr, sizeof(pci_addr), PCI_PRI_FMT,
-			loc->domain, loc->bus, loc->devid, loc->function);
+	pci_vfio_get_device_selector(dev, pci_addr, sizeof(pci_addr),
+			&sysfs_base, &dev_addr, mdev_sysfs, sizeof(mdev_sysfs),
+			mdev_uuid, sizeof(mdev_uuid));
 
 #ifdef HAVE_VFIO_DEV_REQ_INTERFACE
-	ret = pci_vfio_disable_notifier(dev);
-	if (ret) {
-		PCI_LOG(ERR, "fail to disable req notifier.");
-		return -1;
+	if (!pci_vfio_has_mdev_devarg(dev)) {
+		ret = pci_vfio_disable_notifier(dev);
+		if (ret) {
+			PCI_LOG(ERR, "fail to disable req notifier.");
+			return -1;
+		}
 	}
 
 #endif
@@ -1121,8 +1252,8 @@ pci_vfio_unmap_resource_primary(struct rte_pci_device *dev)
 		return -1;
 	}
 
-	ret = rte_vfio_release_device(rte_pci_get_sysfs_path(), pci_addr,
-				      vfio_dev_fd);
+	ret = rte_vfio_release_device(sysfs_base, dev_addr,
+					      vfio_dev_fd);
 	if (ret < 0) {
 		PCI_LOG(ERR, "Cannot release VFIO device");
 		return ret;
@@ -1147,21 +1278,24 @@ static int
 pci_vfio_unmap_resource_secondary(struct rte_pci_device *dev)
 {
 	char pci_addr[PATH_MAX] = {0};
-	struct rte_pci_addr *loc = &dev->addr;
+	char mdev_sysfs[PATH_MAX] = {0};
+	char mdev_uuid[PATH_MAX] = {0};
+	const char *sysfs_base;
+	const char *dev_addr;
 	struct mapped_pci_resource *vfio_res = NULL;
 	struct mapped_pci_res_list *vfio_res_list;
 	int ret, vfio_dev_fd;
 
-	/* store PCI address string */
-	snprintf(pci_addr, sizeof(pci_addr), PCI_PRI_FMT,
-			loc->domain, loc->bus, loc->devid, loc->function);
+	pci_vfio_get_device_selector(dev, pci_addr, sizeof(pci_addr),
+			&sysfs_base, &dev_addr, mdev_sysfs, sizeof(mdev_sysfs),
+			mdev_uuid, sizeof(mdev_uuid));
 
 	vfio_dev_fd = rte_intr_dev_fd_get(dev->intr_handle);
 	if (vfio_dev_fd < 0)
 		return -1;
 
-	ret = rte_vfio_release_device(rte_pci_get_sysfs_path(), pci_addr,
-				      vfio_dev_fd);
+	ret = rte_vfio_release_device(sysfs_base, dev_addr,
+					      vfio_dev_fd);
 	if (ret < 0) {
 		PCI_LOG(ERR, "Cannot release VFIO device");
 		return ret;

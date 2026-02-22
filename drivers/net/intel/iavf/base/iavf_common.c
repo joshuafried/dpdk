@@ -30,6 +30,7 @@ enum iavf_status iavf_set_mac_type(struct iavf_hw *hw)
 			hw->mac.type = IAVF_MAC_XL710;
 			break;
 		case IAVF_DEV_ID_ADAPTIVE_VF:
+		case IAVF_DEV_ID_ICE_MDEV_VF:
 			hw->mac.type = IAVF_MAC_VF;
 			break;
 		default:

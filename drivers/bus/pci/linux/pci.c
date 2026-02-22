@@ -18,6 +18,19 @@
 #include "private.h"
 #include "pci_init.h"
 
+#define PCI_DEVARG_MDEV "mdev="
+
+static bool
+pci_has_mdev_devarg(const struct rte_pci_device *dev)
+{
+	const struct rte_devargs *devargs = dev->device.devargs;
+
+	if (devargs == NULL || devargs->args == NULL)
+		return false;
+
+	return strstr(devargs->args, PCI_DEVARG_MDEV) != NULL;
+}
+
 /**
  * @file
  * PCI probing using Linux sysfs.
@@ -59,6 +72,9 @@ rte_pci_map_device(struct rte_pci_device *dev)
 {
 	int ret = -1;
 
+	if (pci_has_mdev_devarg(dev))
+		dev->kdrv = RTE_PCI_KDRV_VFIO;
+
 	/* try mapping the NIC resources using VFIO if it exists */
 	switch (dev->kdrv) {
 	case RTE_PCI_KDRV_VFIO:
@@ -75,8 +91,15 @@ rte_pci_map_device(struct rte_pci_device *dev)
 		}
 		break;
 	default:
-		PCI_LOG(DEBUG, "  Not managed by a supported kernel driver, skipped");
-		ret = 1;
+		if (pci_has_mdev_devarg(dev)) {
+#ifdef VFIO_PRESENT
+			if (pci_vfio_is_enabled())
+				ret = pci_vfio_map_resource(dev);
+#endif
+		} else {
+			PCI_LOG(DEBUG, "  Not managed by a supported kernel driver, skipped");
+			ret = 1;
+		}
 		break;
 	}
 
@@ -101,7 +124,14 @@ rte_pci_unmap_device(struct rte_pci_device *dev)
 		pci_uio_unmap_resource(dev);
 		break;
 	default:
-		PCI_LOG(DEBUG, "  Not managed by a supported kernel driver, skipped");
+		if (pci_has_mdev_devarg(dev)) {
+#ifdef VFIO_PRESENT
+			if (pci_vfio_is_enabled())
+				pci_vfio_unmap_resource(dev);
+#endif
+		} else {
+			PCI_LOG(DEBUG, "  Not managed by a supported kernel driver, skipped");
+		}
 		break;
 	}
 }
@@ -309,8 +339,11 @@ pci_scan_one(const char *dirname, const struct rte_pci_addr *addr)
 		return -1;
 	}
 
-	if (!ret) {
-		if (!strcmp(driver, "vfio-pci"))
+	if (pci_has_mdev_devarg(dev)) {
+		dev->kdrv = RTE_PCI_KDRV_VFIO;
+	} else if (!ret) {
+		if (!strcmp(driver, "vfio-pci") ||
+				!strcmp(driver, "ice-vfio-pci"))
 			dev->kdrv = RTE_PCI_KDRV_VFIO;
 		else if (!strcmp(driver, "igb_uio"))
 			dev->kdrv = RTE_PCI_KDRV_IGB_UIO;

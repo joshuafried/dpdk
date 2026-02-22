@@ -4,9 +4,11 @@
 
 #include <inttypes.h>
 #include <string.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <linux/iommufd.h>
 
 #include <rte_errno.h>
 #include <rte_log.h>
@@ -21,6 +23,165 @@
 #include "eal_internal_cfg.h"
 
 #define VFIO_MEM_EVENT_CLB_NAME "vfio_mem_event_clb"
+#define VFIO_DEVICES_CDEV_PATH "/dev/vfio/devices"
+#define IOMMUFD_DEV_PATH "/dev/iommu"
+#define VFIO_CDEV_MAX_CTX 64
+
+struct vfio_cdev_ctx {
+	int vfio_dev_fd;
+	int iommufd;
+	__u32 ioas_id;
+};
+
+static struct vfio_cdev_ctx vfio_cdev_ctxs[VFIO_CDEV_MAX_CTX];
+
+static int
+vfio_open_mdev_cdev(const char *sysfs_base, const char *dev_addr, int *vfio_dev_fd)
+{
+	char vfio_dev_dir[PATH_MAX];
+	char cdev_path[PATH_MAX];
+	struct dirent *de;
+	DIR *dir;
+	int fd;
+
+	if (snprintf(vfio_dev_dir, sizeof(vfio_dev_dir), "%s/%s/vfio-dev",
+			sysfs_base, dev_addr) >= (int)sizeof(vfio_dev_dir))
+		return -1;
+
+	dir = opendir(vfio_dev_dir);
+	if (dir == NULL)
+		return -1;
+
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] == '.')
+			continue;
+
+		if (snprintf(cdev_path, sizeof(cdev_path), "%s/%s",
+				VFIO_DEVICES_CDEV_PATH, de->d_name) >=
+				(int)sizeof(cdev_path))
+			continue;
+
+		fd = open(cdev_path, O_RDWR);
+		if (fd >= 0) {
+			*vfio_dev_fd = fd;
+			closedir(dir);
+			EAL_LOG(INFO, "Using VFIO cdev path %s for %s",
+					cdev_path, dev_addr);
+			return 0;
+		}
+	}
+
+	closedir(dir);
+	return -1;
+}
+
+static int
+vfio_has_mdev_cdev(const char *sysfs_base, const char *dev_addr)
+{
+	char vfio_dev_dir[PATH_MAX];
+
+	if (snprintf(vfio_dev_dir, sizeof(vfio_dev_dir), "%s/%s/vfio-dev",
+			sysfs_base, dev_addr) >= (int)sizeof(vfio_dev_dir))
+		return 0;
+
+	return access(vfio_dev_dir, F_OK) == 0;
+}
+
+static int
+vfio_cdev_ctx_add(int vfio_dev_fd, int iommufd, __u32 ioas_id)
+{
+	int i;
+
+	for (i = 0; i < VFIO_CDEV_MAX_CTX; i++) {
+		if (vfio_cdev_ctxs[i].vfio_dev_fd == 0) {
+			vfio_cdev_ctxs[i].vfio_dev_fd = vfio_dev_fd;
+			vfio_cdev_ctxs[i].iommufd = iommufd;
+			vfio_cdev_ctxs[i].ioas_id = ioas_id;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int
+vfio_cdev_ctx_del(int vfio_dev_fd, int *iommufd, __u32 *ioas_id)
+{
+	int i;
+
+	for (i = 0; i < VFIO_CDEV_MAX_CTX; i++) {
+		if (vfio_cdev_ctxs[i].vfio_dev_fd == vfio_dev_fd) {
+			*iommufd = vfio_cdev_ctxs[i].iommufd;
+			*ioas_id = vfio_cdev_ctxs[i].ioas_id;
+			memset(&vfio_cdev_ctxs[i], 0, sizeof(vfio_cdev_ctxs[i]));
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int
+vfio_cdev_bind_iommufd(int vfio_dev_fd, const char *dev_addr)
+{
+	struct iommu_ioas_alloc ioas_alloc = {
+		.size = sizeof(ioas_alloc),
+	};
+	struct vfio_device_bind_iommufd bind = {
+		.argsz = sizeof(bind),
+	};
+	struct vfio_device_attach_iommufd_pt attach = {
+		.argsz = sizeof(attach),
+	};
+	struct iommu_destroy destroy = {
+		.size = sizeof(destroy),
+	};
+	int iommufd;
+
+	iommufd = open(IOMMUFD_DEV_PATH, O_RDWR);
+	if (iommufd < 0) {
+		EAL_LOG(ERR, "Cannot open %s for %s, error %i (%s)",
+			IOMMUFD_DEV_PATH, dev_addr, errno, strerror(errno));
+		return -1;
+	}
+
+	if (ioctl(iommufd, IOMMU_IOAS_ALLOC, &ioas_alloc) < 0) {
+		EAL_LOG(ERR, "IOMMU_IOAS_ALLOC failed for %s, error %i (%s)",
+			dev_addr, errno, strerror(errno));
+		close(iommufd);
+		return -1;
+	}
+
+	bind.iommufd = iommufd;
+	if (ioctl(vfio_dev_fd, VFIO_DEVICE_BIND_IOMMUFD, &bind) < 0) {
+		EAL_LOG(ERR, "VFIO_DEVICE_BIND_IOMMUFD failed for %s, error %i (%s)",
+			dev_addr, errno, strerror(errno));
+		destroy.id = ioas_alloc.out_ioas_id;
+		ioctl(iommufd, IOMMU_DESTROY, &destroy);
+		close(iommufd);
+		return -1;
+	}
+
+	attach.pt_id = ioas_alloc.out_ioas_id;
+	if (ioctl(vfio_dev_fd, VFIO_DEVICE_ATTACH_IOMMUFD_PT, &attach) < 0) {
+		EAL_LOG(ERR, "VFIO_DEVICE_ATTACH_IOMMUFD_PT failed for %s, error %i (%s)",
+			dev_addr, errno, strerror(errno));
+		destroy.id = ioas_alloc.out_ioas_id;
+		ioctl(iommufd, IOMMU_DESTROY, &destroy);
+		close(iommufd);
+		return -1;
+	}
+
+	if (vfio_cdev_ctx_add(vfio_dev_fd, iommufd, ioas_alloc.out_ioas_id) < 0) {
+		EAL_LOG(ERR, "No free VFIO cdev context slots for %s", dev_addr);
+		destroy.id = ioas_alloc.out_ioas_id;
+		ioctl(iommufd, IOMMU_DESTROY, &destroy);
+		close(iommufd);
+		return -1;
+	}
+
+	return 0;
+}
 
 /* hot plug/unplug of VFIO groups may cause all DMA maps to be dropped. we can
  * recreate the mappings for DPDK segments, but we cannot do so for memory that
@@ -750,6 +911,7 @@ rte_vfio_setup_device(const char *sysfs_base, const char *dev_addr,
 	int iommu_group_num;
 	rte_uuid_t vf_token;
 	int i, ret;
+	bool cdev_fallback = false;
 	const struct internal_config *internal_conf =
 		eal_get_internal_configuration();
 
@@ -961,6 +1123,17 @@ rte_vfio_setup_device(const char *sysfs_base, const char *dev_addr,
 	/* get a file descriptor for the device */
 	*vfio_dev_fd = ioctl(vfio_group_fd, VFIO_GROUP_GET_DEVICE_FD, dev_addr);
 	if (*vfio_dev_fd < 0) {
+		if (errno == ENODEV &&
+				vfio_open_mdev_cdev(sysfs_base, dev_addr, vfio_dev_fd) == 0) {
+			close(vfio_group_fd);
+			rte_vfio_clear_group(vfio_group_fd);
+			if (vfio_cdev_bind_iommufd(*vfio_dev_fd, dev_addr) < 0) {
+				close(*vfio_dev_fd);
+				return -1;
+			}
+			cdev_fallback = true;
+			goto dev_get_info;
+		}
 		/* if we cannot get a device fd, this implies a problem with
 		 * the VFIO group or the container not having IOMMU configured.
 		 */
@@ -980,11 +1153,14 @@ dev_get_info:
 				"error %i (%s)", dev_addr, errno,
 				strerror(errno));
 		close(*vfio_dev_fd);
-		close(vfio_group_fd);
-		rte_vfio_clear_group(vfio_group_fd);
+		if (!cdev_fallback) {
+			close(vfio_group_fd);
+			rte_vfio_clear_group(vfio_group_fd);
+		}
 		return -1;
 	}
-	vfio_group_device_get(vfio_group_fd);
+	if (!cdev_fallback)
+		vfio_group_device_get(vfio_group_fd);
 
 	return 0;
 }
@@ -1017,6 +1193,35 @@ rte_vfio_release_device(const char *sysfs_base, const char *dev_addr,
 	/* get the actual group fd */
 	vfio_group_fd = rte_vfio_get_group_fd(iommu_group_num);
 	if (vfio_group_fd < 0) {
+		if (vfio_group_fd == -ENOENT &&
+				vfio_has_mdev_cdev(sysfs_base, dev_addr)) {
+			int iommufd = -1;
+			__u32 ioas_id = 0;
+			struct iommu_destroy destroy = {
+				.size = sizeof(destroy),
+			};
+			struct vfio_device_detach_iommufd_pt detach = {
+				.argsz = sizeof(detach),
+			};
+
+			if (vfio_cdev_ctx_del(vfio_dev_fd, &iommufd, &ioas_id) == 0) {
+				ioctl(vfio_dev_fd, VFIO_DEVICE_DETACH_IOMMUFD_PT, &detach);
+				if (iommufd >= 0) {
+					destroy.id = ioas_id;
+					ioctl(iommufd, IOMMU_DESTROY, &destroy);
+					close(iommufd);
+				}
+			}
+			ret = close(vfio_dev_fd);
+			if (ret < 0) {
+				EAL_LOG(INFO, "Error when closing vfio_dev_fd for %s",
+					   dev_addr);
+				ret = -1;
+			} else {
+				ret = 0;
+			}
+			goto out;
+		}
 		EAL_LOG(INFO, "rte_vfio_get_group_fd failed for %s",
 				   dev_addr);
 		ret = vfio_group_fd;
